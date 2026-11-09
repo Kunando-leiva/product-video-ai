@@ -1,0 +1,72 @@
+"""Genera MP3s de prueba en assets/music/ con FFmpeg.
+
+Útil para tener algo con lo que probar el módulo de música.
+"""
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+def music_dir() -> Path:
+    here = Path(__file__).resolve()
+    repo_root = here.parents[2]
+    d = repo_root / "assets" / "music"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _ffmpeg() -> str:
+    p = shutil.which("ffmpeg")
+    if not p:
+        print("✗ FFmpeg no está en el PATH.")
+        sys.exit(1)
+    return p
+
+
+def generate(name: str, freqs: list[int], duration: int = 120) -> None:
+    """Genera un MP3 con la suma de varias frecuencias."""
+    out = music_dir() / f"{name}.mp3"
+    if out.exists():
+        print(f"  ✓ Ya existe {out.name}")
+        return
+
+    ff = _ffmpeg()
+    # Mezcla tonos con amix
+    inputs: list[str] = []
+    for f in freqs:
+        inputs += ["-f", "lavfi", "-i", f"sine=frequency={f}:duration={duration}"]
+
+    # Filtro de amix + fundido suave
+    filter_complex = (
+        "".join(f"[{i}:a]" for i in range(len(freqs)))
+        + f"amix=inputs={len(freqs)}:duration=longest,"
+        + f"afade=t=in:st=0:d=2,afade=t=out:st={duration-3}:d=3"
+    )
+
+    cmd = [
+        ff, "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-c:a", "libmp3lame",
+        "-b:a", "128k",
+        str(out),
+    ]
+    print(f"  ⚙ Generando {out.name}…")
+    r = subprocess.run(cmd, capture_output=True, text=True, shell=False)
+    if r.returncode != 0:
+        print("✗ Falló:", r.stderr[-300:])
+        return
+    print(f"  ✓ {out.name} ({out.stat().st_size // 1024} KB)")
+
+
+def main() -> None:
+    print("Generando pistas de música de prueba en assets/music/…")
+    generate("tone_calm", [261, 329, 392])          # Do mayor
+    generate("tone_upbeat", [440, 554, 659])        # La mayor
+    generate("tone_energetic", [523, 659, 784])     # Do mayor agudo
+    print("\n✓ Listo.")
+
+
+if __name__ == "__main__":
+    main()
