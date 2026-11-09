@@ -1,10 +1,7 @@
 """Pipeline de render: traduce la timeline a operaciones FFmpeg.
 
-Regla 43: la IA (o el usuario) produce datos estructurados.
-El pipeline los traduce a operaciones del FFmpegEngine.
-
-Regla 57: la IA NUNCA ejecuta comandos. Aquí solo se ejecuta un
-pipeline validado por tipos.
+La timeline es la fuente de verdad: el orden de salida es order_index.
+La IA nunca construye ni ejecuta comandos FFmpeg.
 """
 import logging
 import shutil
@@ -20,14 +17,12 @@ from app.video.ffmpeg_runner import run_ffmpeg
 
 log = logging.getLogger("app.video.render")
 
-
 FORMAT_SIZES: dict[str, tuple[int, int]] = {
     "9:16": (1080, 1920),
     "1:1": (1080, 1080),
     "4:5": (1080, 1350),
     "16:9": (1920, 1080),
 }
-
 
 ProgressCb = Callable[[float], None]
 
@@ -60,16 +55,12 @@ class RenderPipeline:
         self.music_volume = music_volume
         self.on_progress = on_progress
 
-    # ------------------------------------------------------------------
-
     def _emit(self, progress: float) -> None:
         if self.on_progress:
             try:
                 self.on_progress(max(0.0, min(1.0, progress)))
-            except Exception:  # pragma: no cover
+            except Exception:
                 log.exception("on_progress callback falló")
-
-    # ------------------------------------------------------------------
 
     def render(
         self,
@@ -77,69 +68,59 @@ class RenderPipeline:
         media_by_id: dict[str, Media],
     ) -> Path:
         ffmpeg.require_ffmpeg()
-
         if not items:
             raise ValidationError(
                 message="La timeline está vacía.",
                 solution="Agregá al menos un clip antes de renderizar.",
             )
 
-        has_audio = bool(
-            (self.voice_path and self.voice_path.exists())
-            or (self.music_path and self.music_path.exists())
-        )
+        # Validar todo antes de comenzar para no exportar un video parcial.
+        ordered_items = sorted(items, key=lambda item: item.order_index)
+        for item in ordered_items:
+            media = media_by_id.get(item.media_id) if item.media_id else None
+            if media is None:
+                raise ValidationError(
+                    message=f"El clip {item.id} no tiene un archivo asociado.",
+                    solution="Quitá el clip inválido o volvé a importar su archivo.",
+                )
+            if not Path(media.path).is_file():
+                raise ValidationError(
+                    message=f"El archivo ya no existe: {media.original_name}",
+                    solution="Volvé a importar el archivo al proyecto.",
+                )
+            if item.duration <= 0:
+                raise ValidationError(message=f"Duración inválida en el clip {item.id}.")
 
-        # Reparto de progreso
-        p_clips_end = 0.75
-        p_concat_end = 0.90
+        voice = self.voice_path if self.voice_path and self.voice_path.is_file() else None
+        music = self.music_path if self.music_path and self.music_path.is_file() else None
+        has_audio = bool(voice or music)
 
         self.work_dir.mkdir(parents=True, exist_ok=True)
-        for f in self.work_dir.glob("clip_*.mp4"):
-            f.unlink(missing_ok=True)
-        for f in self.work_dir.glob("silent.mp4"):
-            f.unlink(missing_ok=True)
-        for f in self.work_dir.glob("with_audio.mp4"):
-            f.unlink(missing_ok=True)
+        for pattern in ("clip_*.mp4", "silent.mp4", "with_audio.mp4", "concat_list.txt"):
+            for old_file in self.work_dir.glob(pattern):
+                old_file.unlink(missing_ok=True)
 
-        total = len(items)
         rendered: list[Path] = []
-
-        for idx, item in enumerate(items):
-            m = media_by_id.get(item.media_id) if item.media_id else None
-            if m is None:
-                log.warning("Item %s sin media, se omite", item.id)
-                continue
+        total = len(ordered_items)
+        for idx, item in enumerate(ordered_items):
+            media = media_by_id[item.media_id]
             clip = self.work_dir / f"clip_{idx:03d}.mp4"
-            self._render_clip(item, m, clip)
+            self._render_clip(item, media, clip)
             rendered.append(clip)
-            self._emit(p_clips_end * (idx + 1) / max(total, 1))
+            self._emit(0.75 * (idx + 1) / total)
 
-        if not rendered:
-            raise ValidationError(
-                message="Ningún clip pudo renderizarse.",
-                solution="Verificá que los archivos del proyecto sigan en disco.",
-            )
-
-        # Concat (sin audio)
         list_file = self.work_dir / "concat_list.txt"
         list_file.write_text(
-            "\n".join(f"file '{c.name}'" for c in rendered),
+            "".join(f"file '{clip.name}'\\n" for clip in rendered),
             encoding="utf-8",
         )
         silent = self.work_dir / "silent.mp4"
-        run_ffmpeg(
-            [
-                "-y",
-                "-f", "concat",
-                "-safe", "0",
-                "-i", str(list_file),
-                "-c", "copy",
-                str(silent),
-            ]
-        )
-        self._emit(p_concat_end)
+        run_ffmpeg([
+            "-y", "-f", "concat", "-safe", "0",
+            "-i", str(list_file), "-c", "copy", str(silent),
+        ])
+        self._emit(0.90)
 
-        # Si no hay audio, el silent es el final
         if not has_audio:
             self.output_path.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(silent), str(self.output_path))
@@ -147,37 +128,21 @@ class RenderPipeline:
             log.info("Render OK (sin audio): %s", self.output_path)
             return self.output_path
 
-        # Audio: mezclar voz + música sobre el silent
         with_audio = self.work_dir / "with_audio.mp4"
         self._mix_audio(silent, with_audio)
         self._emit(0.98)
-
         self.output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(with_audio), str(self.output_path))
         self._emit(1.0)
         log.info("Render OK (con audio): %s", self.output_path)
         return self.output_path
 
-    # ------------------------------------------------------------------
-
-    def _render_clip(
-        self, item: TimelineItem, media: Media, out_path: Path
-    ) -> None:
+    def _render_clip(self, item: TimelineItem, media: Media, out_path: Path) -> None:
         src = Path(media.path)
-        if not src.exists():
-            raise ValidationError(
-                message=f"El archivo ya no existe: {media.original_name}",
-                solution="Volvé a subirlo al proyecto.",
-            )
-
         vf = build_vf(
-            effect=item.effect,
-            duration=item.duration,
-            width=self.width,
-            height=self.height,
-            fps=self.fps,
+            effect=item.effect, duration=item.duration,
+            width=self.width, height=self.height, fps=self.fps,
         )
-
         args = ["-y"]
         if media.type == "image":
             args += ["-loop", "1", "-t", f"{item.duration:.3f}", "-i", str(src)]
@@ -188,82 +153,38 @@ class RenderPipeline:
                 message=f"Tipo de media no soportado para video: {media.type}",
                 solution="Usá imágenes o videos en la timeline.",
             )
-
         args += [
-            "-vf", vf,
-            "-c:v", "libx264",
-            "-preset", "veryfast",
-            "-pix_fmt", "yuv420p",
-            "-r", str(self.fps),
-            "-an",
-            str(out_path),
+            "-vf", vf, "-c:v", "libx264", "-preset", "veryfast",
+            "-pix_fmt", "yuv420p", "-r", str(self.fps), "-an", str(out_path),
         ]
         run_ffmpeg(args, timeout=300)
 
-    # ------------------------------------------------------------------
-
     def _mix_audio(self, silent_video: Path, out_path: Path) -> None:
-        """Mezcla voz + música sobre el video (Regla 17: música al 10–20%)."""
-        voice = self.voice_path if (self.voice_path and self.voice_path.exists()) else None
-        music = self.music_path if (self.music_path and self.music_path.exists()) else None
+        """Mezcla voz y música y conserva la duración visual del video."""
+        voice = self.voice_path if self.voice_path and self.voice_path.is_file() else None
+        music = self.music_path if self.music_path and self.music_path.is_file() else None
+
+        inputs = ["-i", str(silent_video)]
+        labels: list[str] = []
+        if voice:
+            inputs += ["-i", str(voice)]
+            labels.append(f"[1:a]volume={self.voice_volume}[voice]")
+        if music:
+            inputs += ["-stream_loop", "-1", "-i", str(music)]
+            music_index = 2 if voice else 1
+            labels.append(f"[{music_index}:a]volume={self.music_volume}[music]")
 
         if voice and music:
-            # Voz al 100%, música al X% + loop de música para cubrir el video
-            filter_complex = (
-                f"[1:a]volume={self.voice_volume}[voice];"
-                f"[2:a]volume={self.music_volume}[music];"
-                f"[voice][music]amix=inputs=2:duration=first:dropout_transition=0[aout]"
-            )
-            run_ffmpeg(
-                [
-                    "-y",
-                    "-i", str(silent_video),
-                    "-i", str(voice),
-                    "-stream_loop", "-1", "-i", str(music),
-                    "-filter_complex", filter_complex,
-                    "-map", "0:v",
-                    "-map", "[aout]",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-b:a", "192k",
-                    "-shortest",
-                    str(out_path),
-                ],
-                timeout=600,
-            )
+            labels.append("[voice][music]amix=inputs=2:duration=longest:dropout_transition=0,apad[aout]")
         elif voice:
-            # Solo voz
-            run_ffmpeg(
-                [
-                    "-y",
-                    "-i", str(silent_video),
-                    "-i", str(voice),
-                    "-map", "0:v",
-                    "-map", "1:a",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-filter:a", f"volume={self.voice_volume}",
-                    "-shortest",
-                    str(out_path),
-                ],
-                timeout=600,
-            )
+            labels.append("[voice]apad[aout]")
         elif music:
-            # Solo música (con loop para cubrir el video)
-            run_ffmpeg(
-                [
-                    "-y",
-                    "-i", str(silent_video),
-                    "-stream_loop", "-1", "-i", str(music),
-                    "-map", "0:v",
-                    "-map", "1:a",
-                    "-c:v", "copy",
-                    "-c:a", "aac",
-                    "-filter:a", f"volume={self.music_volume}",
-                    "-shortest",
-                    str(out_path),
-                ],
-                timeout=600,
-            )
-        else:  # pragma: no cover — no debería llegar
-            shutil.copy(silent_video, out_path)
+            labels.append("[music]apad[aout]")
+
+        run_ffmpeg([
+            "-y", *inputs, "-filter_complex", ";".join(labels),
+            "-map", "0:v:0", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac", "-b:a", "192k",
+            "-t", f"{ffmpeg.probe_duration(silent_video) or 0:.3f}",
+            "-shortest", str(out_path),
+        ], timeout=600)
