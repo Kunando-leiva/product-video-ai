@@ -111,7 +111,7 @@ class RenderPipeline:
 
         list_file = self.work_dir / "concat_list.txt"
         list_file.write_text(
-            "".join(f"file '{clip.name}'\\n" for clip in rendered),
+            "".join(f"file '{clip.name}'\n" for clip in rendered),
             encoding="utf-8",
         )
         silent = self.work_dir / "silent.mp4"
